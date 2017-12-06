@@ -1,8 +1,32 @@
-from functools import wraps
+from datetime import datetime
+from functools import wraps, partial
 import logging
 import pandas as pd
 import re
 import sys
+
+
+# Have a verbose setting for when you have to go FULL MARXIST HISTORIAN
+logging.VERBOSE = 5
+logging.addLevelName(logging.VERBOSE, "VERBOSE")
+logging.Logger.verbose = lambda inst, msg, *args, **kwargs:\
+                         inst.log(logging.VERBOSE, msg, *args, **kwargs)
+logging.verbose = lambda msg, *args, **kwargs:\
+                  logging.log(logging.VERBOSE, msg, *args, **kwargs)  
+
+_logging_vals = dict(
+    format=None, 
+    level=logging.VERBOSE, 
+    filename="pattern_miner.log",
+    filemode='w'
+)
+
+
+if not _logging_vals.get("format"):
+    _logging_vals["format"] = '%(asctime)s - %(name)s - '+\
+                 '%(levelname)s - %(message)s'
+    logging.basicConfig(**_logging_vals)
+    logger = logging.getLogger(__name__)
 
 def updt(total, progress):
     """
@@ -24,16 +48,84 @@ def updt(total, progress):
     sys.stdout.flush()
 
 
+_CCFNS = dict(
+    CONVERT_DATE="convert_date",
+    CONVERT_TIME="convert_time",
+    CONVERT_DATETIME="convert_datetime",
+    MERGE_DATE_AND_TIME="merge_date_and_time"
+)
+
+class ChunkCleaner(object):
+    def __init__(self, gem_clean_map, **kwargs):
+        self.gems = {}
+        for gem, op in gem_clean_map.items():
+            gemargs = kwargs.get(gem)
+            if gemargs:
+                self.gems = partial(getattr(self, _CCFNS[op]), **gemargs)  
+            else:
+                self.gems[gem] = getattr(self, _CCFNS[op])
+
+    def __iter__(self):
+        for gem, op in self.gems.items():
+            yield(gem, op)
+            
+    @staticmethod
+    def convert_date(date, frmt="%Y-%m-%d"):
+        return datetime.strptime(date, frmt)
+
+    @staticmethod
+    def convert_time(_time, frmt="%H:%M:%S,%f"): 
+        return datetime.strptime(_time, frmt)
+
+    @staticmethod
+    def convert_datetime(dtime, frmt="%Y-%m-%d %H:%M:%S,%f"):
+        return datetime.strptime(dtime, frmt)
+
+
 class PatternChunk(object):
-    def __init__(self, pattern, is_repeating, optional):
+    def __init__(self, pattern, is_repeating, optional, cleaning_ops=None):
         self.repeats = is_repeating
         self.optional = optional
         self.pattern = re.compile(pattern) if type(pattern) == str else pattern
+        self.gems = dict()
+        self._prep_chunk(cleaning_ops)
+
+    def _prep_chunk(self, cleaning_ops=None):
+        gcol = re.compile("\?P\<([\w\d]+)", re.MULTILINE)
+        to_id = gcol.findall(self.pattern.pattern)
+        if to_id:
+            if self.repeats:
+                to_id = [tid + "_#" for tid in to_id]
+                logger.info(
+                    f"MiningPattern is looking for repeating values: '{to_id}'"
+                )
+            else:
+                logger.info(f"MiningPattern is looking for: '{to_id}'")
+            self.gems.update({tid: None for tid in to_id})
+            logger.debug(
+                f"Preparing cleaning operations for chunk: '{self}'"
+            )
+            if cleaning_ops:
+                for gem, op in cleaning_ops:
+                    if gem not in self.gems:
+                        raise IndexError(f"No gem named '{gem}' in chunk")
+                    else:
+                        self.gems[gem] = op
+        else:
+            logger.warning(
+                f"Could not find anything to look for in chunk: '{self}'"
+            )
 
     def match(self, line):
         m = self.pattern.match(line)
         if m:
-            return m, line[m.span()[1]:]
+            groupdict = m.groupdict()
+            for k in groupdict.keys():
+                op = self.gems.get(k)
+                if op:
+                    logger.verbose(f"Cleaning '{k}' with '{op}'")
+                    groupdict[k] = op(groupdict[k])                
+            return groupdict, line[m.span()[1]:]
         else:
             return None, line
 
@@ -45,47 +137,87 @@ class PatternChunk(object):
             rep += " REPEATS "
         return rep.strip() + ">"
 
+_PCFNS = dict(
+    MERGE_DATE_AND_TIME="merge_date_and_time"
+)
+
+class PatternCleaner(object):
+    def __init__(self, clean_ops):
+        self.operations = []
+        for op, gemargs in clean_ops:
+            if gemargs:
+                self.operations.append(partial(
+                    getattr(self, _PCFNS[op]), **gemargs
+                ))  
+            else:
+                self.operations.append(getattr(self, _PCFNS[op]))
+
+    @staticmethod
+    def merge_date_and_time(presults, datecol="date",
+                            timecol="time", outcol="datetime"):
+        date = presults[datecol]
+        _time = presults[timecol]
+        presults[outcol] = datetime.combine(date, _time.time())  
+        del presults[datecol]
+        del presults[timecol]
+        return presults
+
+    def clean(self, presults):
+        operations = self.operations.copy()
+        while operations:
+            operation = operations.pop(0)
+            presults = operation(presults)
+        return presults
 
 class MiningPattern(object):
-    def __init__(self, chunks):
+    def __init__(self, chunks, post_clean_ops=None):
         self.chunks = chunks
         self.pattern_begun = False
         self.errors = []
         self.skipped = []
-        self.logger = None
+        self.gems = []
+        self._prep_pattern()
+        logger.debug(f"Setting '_clean_ops' to {post_clean_ops}")
+        self._clean_ops = post_clean_ops
 
-    def inject_logger(self, logger):
-        self.logger = logger
-    
+    def _prep_pattern(self, post_clean_ops=None):
+        for chunk in self.chunks:
+            gems = chunk.gems.keys()           
+            self.gems.extend(gems)
+
+        logger.debug(
+            f"Gems pattern '{self}' is looking for are: '{self.gems}'"
+        )
+
     def _match_chunk(self, start, chunk, line, i, in_prog=0):
         presult = None
 
-        self.logger.debug(f"On chunk: '{chunk}'")
+        logger.debug(f"On chunk: '{chunk}'")
         m, line = chunk.match(line)
         if m:
             if not self.pattern_begun:
-                self.logger.debug("Pattern started")
+                logger.verbose("Pattern started")
                 self.pattern_begun = True
-            self.logger.debug(f"Matched chunk '{chunk}' on {line}")
+            logger.verbose(f"Matched chunk '{chunk}' on {line}")
             if chunk.repeats:
                 d = dict()
-                for k,v in m.groupdict().items():
+                for k,v in m.items():
                     d[k+f"_{in_prog}"] = v
                 return self._return_result(d, start, i), line
             else:
-                return self._return_result(m.groupdict(), start, i), line
+                return self._return_result(m, start, i), line
 
         elif chunk.optional and self.pattern_begun:
-            self.logger.debug(f"Incremening chunk_id to '{chunk_id}'")
+            logger.verbose(f"Incremening chunk_id to '{chunk_id}'")
             if len(self.chunks) == chunk_id:
-                self.logger.debug(f"No chunks left, returning {presult}")
+                logger.verbose(f"No chunks left, returning {presult}")
                 return presult, line
         elif not self.pattern_begun:
             msg = "Pattern has not begun, and no match."
-            self.logger.debug(msg + f" Returning {presult}.")
+            logger.verbose(msg + f" Returning {presult}.")
             return presult, line
         elif chunk.repeats:
-            self.logger.debug(f"Chunk {chunk} at end.")
+            logger.verbose(f"Chunk {chunk} at end.")
             return None, line
         else:
             return False, line
@@ -95,7 +227,7 @@ class MiningPattern(object):
         if start == None:
             presult["start"] = i
         presult["end"] = i
-        self.logger.debug(f"Returning result '{presult}'")
+        logger.verbose(f"Returning result '{presult}'")
         return presult
 
     def _cascade_chunks(self, line):
@@ -103,14 +235,21 @@ class MiningPattern(object):
         chunks = self.chunks[1:]
         while chunks:
             chunk = chunks.pop(0)
-            self.logger.debug(f"Trying chunk: {chunk}")
+            logger.verbose(f"Trying chunk: {chunk}")
             if chunk.match(line):
                 self.chunks = chunks
                 return self._return_result(chunk.match(line).groupdict())
         return None
     
-    def _reset_pattern(self):
+    def _reset_pattern(self, presults):
         self.pattern_begun = False
+        if self._clean_ops:
+            logger.debug(
+                f"Running pattern cleaner '{self._clean_ops}' on '{presults}'"
+            )
+            return self._clean_ops.clean(presults)
+        else:
+            return presults
 
     def match(self, lines, start=None):
         presults = dict(start=start, end=0)
@@ -118,31 +257,33 @@ class MiningPattern(object):
         chunks = self.chunks.copy()
         while chunks and lines:
             i, line = lines.pop(0)
-            self.logger.debug(f"Popped line #{i}: {repr(line)}")
+            logger.verbose(f"Popped line #{i}: {repr(line)}")
             while line:
-                self.logger.debug(f"Running on line {repr(line)}...")
+                logger.verbose(f"Running on line {repr(line)}...")
                 if len(chunks) == 0:
-                    self.logger.debug(f"Out of chunks...breaking from {repr(line)}")
+                    logger.verbose(
+                        f"Out of chunks...breaking from {repr(line)}"
+                    )
                     break
                 else:
                     chunk = chunks[0]
-                    self.logger.debug("...with chunk: {repr(chunk)}")
+                    logger.verbose("...with chunk: {repr(chunk)}")
                 presult, line = self._match_chunk(
                     presults.get("start"), chunk, line, i, in_prog
                 )
                 if presult:
                     if chunks[0].repeats:
-                        self.logger.debug(
+                        logger.verbose(
                             f"Setting in_prog from {in_prog} to {in_prog+1}"
                         ) 
                         in_prog += 1
                     else:
-                        self.logger.debug(f"Popping chunk: {chunks[0]}")
+                        logger.verbose(f"Popping chunk: {chunks[0]}")
                         chunks.pop(0)
                     presults.update(presult)
                     presults["end"] += 1
                 elif presult == False:
-                    self.logger.debug(
+                    logger.debug(
                         f"Could not match {line} with {chunk}"
                     )
                     self.errors.append((line, chunk))
@@ -151,29 +292,28 @@ class MiningPattern(object):
                     if chunks[0].repeats:
                         in_prog = 0
                         msg = "Encountered end of repeating chunk. "
-                        self.logger.debug(msg+f"Popping chunk: {chunks[0]}")
+                        logger.verbose(msg+f"Popping chunk: {chunks[0]}")
                         chunks.pop(0)
                         break
                     elif not self.pattern_begun:
-                        self.logger.debug(
+                        logger.verbose(
                             "Pattern has not begun, so skipping line."
                         )
                         break
                     else:
-                        self.logger.warning("Unexpected condition in match()")            
+                        logger.warning("Unexpected condition in match()")            
         
         if chunks and not lines and self.pattern_begun:
             raise IndexError(
                 f"There are '{len(self.chunks)}' chunks and no lines left."
             )
         else:
-            self.logger.debug("Pattern matched. Reseting pattern")
-            self._reset_pattern()
-            return presults
-            
+            logger.debug("Pattern matched. Reseting pattern")
+            return self._reset_pattern(presults)
+
 
 class Miner(object):
-    def __init__(self, pattern, logformat=None):
+    def __init__(self, pattern):
         self._current_doc = []
         self.mined_store = dict(
             _meta=dict(
@@ -181,23 +321,7 @@ class Miner(object):
                 indices=[]
             )
         )
-
         self.pattern = pattern
-
-        if not logformat:
-            self.logger = self.establish_logger()
-        else:
-            self.logger = self.establish_logger(**logformat)
-        self.pattern.inject_logger(self.logger)
-
-    @staticmethod
-    def establish_logger(format=None, level=logging.INFO, 
-                         filename="pattern_miner.log", filemode='w'):
-        if not format:
-            fmt = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        logging.basicConfig(format=format, level=level,
-                            filename=filename, filemode=filemode)
-        return logging.getLogger(__name__)  
 
     def __len__(self):
         return self.mined_store['_meta']['records']
@@ -208,13 +332,13 @@ class Miner(object):
             self._current_doc = []
             while fname:
                 curdoc = fname.pop(0)
-                self.logger.info(f"Loading '{curdoc}'...")                      
+                logger.info(f"Loading '{curdoc}'...")                      
                 with open(curdoc, 'r', errors="replace") as f:
                     self._current_doc.extend(
                         (i+last,l) for i,l in enumerate(f.readlines())
                     )
                     last = len(self._current_doc)
-                self.logger.info(f"Loaded {fname} with '{last}' records.")
+                logger.info(f"Loaded {fname} with '{last}' records.")
         else:
             with open(fname, 'r', errors="replace") as f:
                 self._current_doc = [(i,l) for i,l in enumerate(f.readlines())]
@@ -225,21 +349,21 @@ class Miner(object):
             di = kwargs.get('doc_index', "")
             res = None
             if not di:
-                self.logger.debug(
+                logger.debug(
                     f"No 'doc_index' key in kwargs; kwargs='{kwargs}'"
                 )
                 # TODO: Note that 'doc_index' is expected to be first arg
                 # if not in kwargs
                 di = args[0]
                 if not di:
-                    self.logger.warning("Couldn't find index in args or kwargs")
+                    logger.warning("Couldn't find index in args or kwargs")
             if di:
-                self.logger.debug(f"Modifying index for '{di}'")
+                logger.debug(f"Modifying index for '{di}'")
                 self.mined_store['_meta']['indices'].append(di)
             try:
                 res = method(self, *args, **kwargs)
             except:
-                self.logger.exception("Uncaught exception")
+                logger.exception("Uncaught exception")
                 if di in self.mined_store['_meta']['indices']:
                     self.mined_store['_meta']['indices'].remove(di)
                 raise
@@ -263,12 +387,12 @@ class Miner(object):
         line = None
         while lines:           
             pres = self.pattern.match(lines, start)
-            self.logger.debug(
+            logger.debug(
                 f"Appending result '{pres}' to mined_store '{doc_index}'"
             )
             if pres:
                 self.mined_store[doc_index].append(pres)
-                self.logger.debug(
+                logger.debug(
                     f"Moving lines from index '{start}' to "
                     f"'{pres.get('end') + 1}'"
                 )
@@ -279,10 +403,10 @@ class Miner(object):
     def offload_document_into_dataframe(self, doc_index, popdata=True):
         df = pd.DataFrame(self.mined_store[doc_index])
         if popdata:
-            self.logger.info(f"Removing index '{doc_index}'")
+            logger.info(f"Removing index '{doc_index}'")
             del self.mined_store[doc_index]
             self.mined_store['_meta']['indices'].remove(doc_index)
-            self.logger.info(
+            logger.info(
                 f"Remaining indices are {self.mined_store['_meta']['indices']}"
             )
         return df

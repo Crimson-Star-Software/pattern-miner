@@ -1,0 +1,10 @@
+# Logs
+*.log
+
+# Excel files
+*.xls
+*.xlsx
+
+# PyCache
+__pycache__
+
